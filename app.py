@@ -31,6 +31,13 @@
   两孔坐标与实际净距。冲突时不生成展开 SVG、禁止下载，反查待确认结果
   无法确认、排版方案不可用。反查按「加入现有孔位后的全集」判定，
   排版按「替换后的方案」判定。
+- 最大安全半径分析：沿用当前纸张尺寸、折叠顺序、折叠面孔点、原纸保护区
+  与最小纸桥宽度，以 0.001mm 为刻度，在打孔半径取值范围内求现有孔位可
+  采用的最大统一打孔半径。同时取折叠面各孔到边界/折痕的余量、展开孔到
+  保护区的最近距离（相切即违规，须严格小于）、启用纸桥约束时去重展开孔
+  最小圆心距给出的间距上界，以及打孔器容量上限；刻度化结果用现有展开
+  校验复核，保证可实际通过，并给出决定该值的孔位与限制原因。无孔、
+  保护区越界或不存在可用半径时返回明确提示。
 - A4 分页定位模板：把合法展开结果按实际毫米 1:1 排到纵向 A4 页
   （210×297mm，四边留白 10mm，可打印区 190×277mm，相邻页重叠 15mm），
   按原纸尺寸计算覆盖全纸的分页窗口（窗口从原纸左下角起排，列自左而右、
@@ -757,6 +764,17 @@ def _num(obj, key, lo, hi, name):
     return val
 
 
+def _validate_folds(payload):
+    """校验折叠顺序，返回折法列表。"""
+    folds = payload.get("folds", [])
+    if not isinstance(folds, list) or len(folds) > MAX_FOLDS:
+        raise ValueError(f"折叠次数须为 0 ~ {MAX_FOLDS} 次")
+    for f in folds:
+        if f not in ALLOWED_FOLDS:
+            raise ValueError("存在非法折叠方向，可选：vL / vR / hT / hB")
+    return folds
+
+
 def _validate_sheet(payload):
     """校验纸张尺寸、打孔半径、折法与最小纸桥宽度。
 
@@ -768,14 +786,7 @@ def _validate_sheet(payload):
     radius = _num(payload, "radius", MIN_RADIUS, MAX_RADIUS, "打孔半径")
     min_bridge = _num(payload, "minBridge", MIN_BRIDGE, MAX_BRIDGE,
                       "最小纸桥宽度") if payload.get("minBridge") is not None else 0.0
-
-    folds = payload.get("folds", [])
-    if not isinstance(folds, list) or len(folds) > MAX_FOLDS:
-        raise ValueError(f"折叠次数须为 0 ~ {MAX_FOLDS} 次")
-    for f in folds:
-        if f not in ALLOWED_FOLDS:
-            raise ValueError("存在非法折叠方向，可选：vL / vR / hT / hB")
-    return width, height, radius, folds, min_bridge
+    return width, height, radius, _validate_folds(payload), min_bridge
 
 
 def _validate_norm_points(payload):
@@ -1182,6 +1193,257 @@ def plan_layout(payload):
 
 
 # ---------------------------------------------------------------------------
+# 最大安全半径分析（以 0.001mm 为刻度）
+# ---------------------------------------------------------------------------
+RADIUS_STEP = 0.001   # mm，最大安全半径的分析刻度
+
+# 各限制因素的展示名称
+LIMIT_LABELS = {
+    "edge": "折叠面边界/折痕余量",
+    "capacity": "打孔器容量（折叠面尺寸）",
+    "zone": "保护区最近距离",
+    "bridge": "纸桥净距上限",
+    "range": "打孔半径取值上限",
+}
+
+
+def closest_pair_distance(points):
+    """去重展开孔中圆心距最近的一对。
+
+    与 find_bridge_conflict 同一思路的动态空间网格：格子边长取当前最近
+    距离，新点只检查相邻九宫格，发现更近对时按新距离重建网格；判定结果
+    与逐对比较一致，但避免平方级扫描。points 为 (x, y) 列表，返回
+    (下标 i, 下标 j, 圆心距)；少于 2 个点返回 None。
+    """
+    if len(points) < 2:
+        return None
+    # 用前两点的圆心距作为初始最近距离与格子边长
+    (x0, y0), (x1, y1) = points[0], points[1]
+    best = [math.hypot(x1 - x0, y1 - y0), 0, 1]   # [圆心距, i, j]
+    cell = best[0] if best[0] > 0.0 else 1.0
+    cells = {}
+
+    def insert(idx):
+        x, y = points[idx]
+        key = (math.floor(x / cell), math.floor(y / cell))
+        cells.setdefault(key, []).append(idx)
+
+    insert(0)
+    insert(1)
+    for j in range(2, len(points)):
+        x, y = points[j]
+        cx, cy = math.floor(x / cell), math.floor(y / cell)
+        nearer = False
+        for ix in (cx - 1, cx, cx + 1):
+            for iy in (cy - 1, cy, cy + 1):
+                for i in cells.get((ix, iy), ()):
+                    d = math.hypot(x - points[i][0], y - points[i][1])
+                    if d < best[0]:
+                        best = [d, i, j]
+                        nearer = True
+        if nearer:
+            # 最近距离更新：按新距离重建已插入点的网格
+            cell = best[0] if best[0] > 0.0 else cell
+            cells.clear()
+            for t in range(j):
+                insert(t)
+        insert(j)
+    return (best[1], best[2], best[0])
+
+
+def analyze_max_radius(payload):
+    """最大安全半径分析：现有孔位可采用的最大统一打孔半径。
+
+    沿用当前纸张尺寸、折叠顺序、折叠面孔点、原纸保护区与最小纸桥宽度，
+    以 0.001mm 为刻度，在 [MIN_RADIUS, MAX_RADIUS] 内求最大半径，同时满足：
+    - 折叠面各孔到四边（边界/折痕）的余量（check_point 同规则，含
+      EDGE_TOL 与 ROUND_TRIP_TOL 宽限，相等可通过）；
+    - 展开孔到任一保护区的最近距离（相交/相切即违规，半径须严格小于
+      最近距离 - EDGE_TOL）；
+    - 启用纸桥约束时，去重展开孔最小圆心距给出的上界
+      （(圆心距 - minBridge) / 2，相等可通过）；
+    - 折叠面放得下打孔器（_check_face_capacity 同规则，可取等）。
+    刻度化后的结果再用 compute 复核（浮点兜底），保证可实际通过现有展开
+    校验；同时返回决定该值的孔位与限制原因。无孔、保护区越界或不存在
+    可用半径时返回明确提示（feasible=False）。
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("请求体必须是 JSON 对象")
+    width = _num(payload, "width", MIN_DIM, MAX_DIM, "纸张宽度")
+    height = _num(payload, "height", MIN_DIM, MAX_DIM, "纸张高度")
+    min_bridge = _num(payload, "minBridge", MIN_BRIDGE, MAX_BRIDGE,
+                      "最小纸桥宽度") if payload.get("minBridge") is not None else 0.0
+    folds = _validate_folds(payload)
+    zones = _validate_zones(payload)
+    norm_pts = _validate_norm_points(payload)
+
+    if not norm_pts:
+        return {"ok": True, "feasible": False, "reason": "noHoles",
+                "message": "当前没有打孔点，无法分析最大安全半径，"
+                           "请先在折叠面上打孔。"}
+
+    # 保护区必须完整位于原纸内（与展开校验同一规则）
+    oob = zone_out_of_bounds(zones, width, height)
+    if oob is not None:
+        return {"ok": True, "feasible": False, "reason": "zoneBounds",
+                "zoneIndex": oob,
+                "message": zone_bounds_msg(oob, zones[oob], width, height)
+                           + "请先修正或删除越界保护区，再分析最大安全半径。"}
+
+    w, h, edges, nv, nh = folded_state(width, height, folds)
+    mm_pts = [{"x": p["x"] * w, "y": p["y"] * h} for p in norm_pts]
+    n_images = 2 ** len(folds)
+    raw = unfold_points(mm_pts, folds, width, height)
+
+    constraints = []
+
+    # 约束一：折叠面各孔到四边（边界/折痕）的余量
+    # check_point 通过条件：dist >= radius + EDGE_TOL - ROUND_TRIP_TOL（可取等）
+    hit = None
+    for i, p in enumerate(mm_pts):
+        for key, dist in (("x0", p["x"]), ("x1", w - p["x"]),
+                          ("y0", p["y"]), ("y1", h - p["y"])):
+            lim = dist - EDGE_TOL + ROUND_TRIP_TOL
+            if hit is None or lim < hit[0]:
+                hit = (lim, i, key, dist)
+    lim, i, key, dist = hit
+    constraints.append({
+        "kind": "edge", "strict": False, "upperBound": lim,
+        "pointIndex": i, "edge": key, "distance": round(dist, 6),
+        "detail": (f"打孔点 #{i + 1}（折叠面 ({mm_pts[i]['x']:.2f}, "
+                   f"{mm_pts[i]['y']:.2f})mm）距"
+                   f"{EDGE_NAMES[edges[key]][key]}仅 {max(dist, 0.0):.3f}mm"),
+    })
+
+    # 约束二：折叠面放得下打孔器（_check_face_capacity 同规则，可取等）
+    constraints.append({
+        "kind": "capacity", "strict": False,
+        "upperBound": (min(w, h) - 2 * EDGE_TOL) / 2.0,
+        "detail": f"折叠面 {w:g} × {h:g}mm 须容纳打孔器直径与边界容差",
+    })
+
+    # 约束三：展开孔到保护区的最近距离（相交/相切即违规，须严格小于）
+    if zones:
+        hit = None
+        for k, (x, y) in enumerate(raw):
+            src = k // n_images
+            for zi, z in enumerate(zones):
+                dx = max(z["x"] - x, 0.0, x - (z["x"] + z["w"]))
+                dy = max(z["y"] - y, 0.0, y - (z["y"] + z["h"]))
+                lim = math.hypot(dx, dy) - EDGE_TOL
+                if hit is None or lim < hit[0]:
+                    hit = (lim, src, (x, y), zi)
+        lim, src, (hx, hy), zi = hit
+        z = zones[zi]
+        constraints.append({
+            "kind": "zone", "strict": True, "upperBound": lim,
+            "pointIndex": src,
+            "hole": {"x": round(hx, 6), "y": round(hy, 6)}, "zoneIndex": zi,
+            "distance": round(lim + EDGE_TOL, 6),
+            "detail": (f"打孔点 #{src + 1} 的展开孔 ({hx:.2f}, {hy:.2f})mm "
+                       f"距保护区 #{zi + 1}（x {z['x']:g} ~ "
+                       f"{z['x'] + z['w']:g}mm，y {z['y']:g} ~ "
+                       f"{z['y'] + z['h']:g}mm）仅 {lim + EDGE_TOL:.3f}mm"
+                       "（相切即违规，半径须严格小于该余量）"),
+        })
+
+    # 约束四：纸桥净距（去重展开孔的最小圆心距，(圆心距 - minBridge)/2，可取等）
+    if min_bridge > 0.0:
+        uniq, _idx = dedupe_with_index(raw)
+        pair = closest_pair_distance(uniq)
+        if pair is not None:
+            ia, ib, dist = pair
+            (ax, ay), (bx, by) = uniq[ia], uniq[ib]
+            constraints.append({
+                "kind": "bridge", "strict": False,
+                "upperBound": (dist - min_bridge) / 2.0,
+                "holeA": {"x": round(ax, 6), "y": round(ay, 6)},
+                "holeB": {"x": round(bx, 6), "y": round(by, 6)},
+                "distance": round(dist, 6),
+                "detail": (f"去重展开孔 ({ax:.2f}, {ay:.2f})mm 与 "
+                           f"({bx:.2f}, {by:.2f})mm 的圆心距仅 {dist:.3f}mm"
+                           f"（净距须不小于最小纸桥宽度 {min_bridge:g}mm）"),
+            })
+
+    # 汇总：上限取各约束与打孔半径取值上限的最小值
+    binding = min(constraints, key=lambda c: c["upperBound"])
+    if binding["upperBound"] > MAX_RADIUS:
+        binding = {"kind": "range", "strict": False, "upperBound": MAX_RADIUS,
+                   "detail": f"各约束余量均超出打孔半径上限 {MAX_RADIUS:g}mm，"
+                             "取取值范围上限"}
+
+    # 以 0.001mm 为刻度向下取整；严格约束（保护区相切即违规）取到刻度值时
+    # 仍须再退一格，保证半径严格小于其余量
+    r_final = math.floor(binding["upperBound"] / RADIUS_STEP + 1e-9) * RADIUS_STEP
+    strict_min = min((c["upperBound"] for c in constraints if c["strict"]),
+                     default=None)
+    while strict_min is not None and r_final > strict_min - 1e-9:
+        r_final -= RADIUS_STEP
+
+    # 用现有展开校验复核（浮点兜底），保证给出的值可实际通过。
+    # 各约束关于半径均单调（更小必更安全），数学上首次即应通过，
+    # 递减只为吸收浮点误差，故限制尝试次数。
+    feasible = False
+    attempts = 0
+    while r_final >= MIN_RADIUS - 1e-12 and attempts < 1000:
+        attempts += 1
+        r_try = round(r_final, 3)
+        verify = dict(payload)
+        verify["radius"] = r_try
+        try:
+            err = compute(verify)["error"]
+        except ValueError as exc:   # 如折叠面容量校验以 ValueError 抛出
+            err = str(exc)
+        if err is None:
+            feasible = True
+            r_final = r_try
+            break
+        r_final -= RADIUS_STEP
+
+    # 对外结构：补充展示名称，上限保留 6 位小数
+    def pub(c):
+        out = {"kind": c["kind"], "label": LIMIT_LABELS[c["kind"]],
+               "strict": c["strict"],
+               "upperBound": round(c["upperBound"], 6),
+               "detail": c["detail"]}
+        for k in ("pointIndex", "edge", "distance", "hole", "zoneIndex",
+                  "holeA", "holeB"):
+            if k in c:
+                out[k] = c[k]
+        return out
+
+    constraints_out = sorted((pub(c) for c in constraints),
+                             key=lambda c: c["upperBound"])
+    if not feasible:
+        return {
+            "ok": True, "feasible": False, "reason": "noRadius",
+            "message": (f"不存在可用半径：最紧限制为"
+                        f"{LIMIT_LABELS[binding['kind']]}——{binding['detail']}，"
+                        f"按 0.001mm 刻度在取值范围 {MIN_RADIUS:g} ~ "
+                        f"{MAX_RADIUS:g}mm 内已无可取半径。"
+                        "请调整孔位、保护区或纸桥宽度后重试。"),
+            "limit": pub(binding),
+            "constraints": constraints_out,
+        }
+
+    r_final = round(r_final, 3)
+    return {
+        "ok": True,
+        "feasible": True,
+        "maxRadius": r_final,
+        "step": RADIUS_STEP,
+        "minRadius": MIN_RADIUS,
+        "maxRadiusLimit": MAX_RADIUS,
+        "limit": pub(binding),
+        "constraints": constraints_out,
+        "message": (f"最大安全半径 {r_final:.3f}mm（0.001mm 刻度，取值范围 "
+                    f"{MIN_RADIUS:g} ~ {MAX_RADIUS:g}mm）；决定因素："
+                    f"{LIMIT_LABELS[binding['kind']]}——{binding['detail']}。"
+                    "该值已通过现有展开校验复核。"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # 路由
 # ---------------------------------------------------------------------------
 @app.route("/")
@@ -1226,6 +1488,19 @@ def api_plan():
         return _bad("请求不是合法 JSON")
     try:
         return jsonify(plan_layout(payload))
+    except ValueError as exc:
+        return _bad(str(exc))
+
+
+@app.route("/api/max-radius", methods=["POST"])
+def api_max_radius():
+    """最大安全半径分析：入参 {width, height, folds, points, zones,
+    minBridge?}（radius 由本接口求解，入参中的 radius 忽略）。"""
+    payload = request.get_json(force=True, silent=True)
+    if payload is None:
+        return _bad("请求不是合法 JSON")
+    try:
+        return jsonify(analyze_max_radius(payload))
     except ValueError as exc:
         return _bad(str(exc))
 
