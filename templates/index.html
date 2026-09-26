@@ -156,6 +156,13 @@
     <label class="field"><span>最小纸桥宽度 (mm，0 表示关闭；相邻孔圆边净距小于该值即冲突，相等可通过)</span>
       <input type="number" id="inBridge" min="0" max="{{ max_dim }}" step="0.5" value="0">
     </label>
+    <div class="toolbar" style="margin-top:2px">
+      <button type="button" id="btnMaxRadius"
+              title="沿用当前纸张、折法、孔位、保护区与纸桥宽度，以 0.001mm 为刻度计算现有孔位可采用的最大统一打孔半径">分析最大安全半径</button>
+      <button type="button" id="btnApplyRadius" class="primary" style="display:none"
+              title="把分析得到的最大安全半径填入打孔半径，并重新调用现有展开校验">应用半径</button>
+    </div>
+    <p class="hint" id="maxRadiusInfo"></p>
     <div class="presets">
       <button type="button" data-preset="a4">A4 纵向 210×297</button>
       <button type="button" data-preset="a4l">A4 横向 297×210</button>
@@ -314,6 +321,10 @@
   var planPreview = null;   // 待确认的排版方案（/api/plan 返回）
   var planSeq = 0;          // 排版请求序号；纸张/半径/折法/保护区一变即作废
 
+  // 最大安全半径分析：以 0.001mm 刻度求现有孔位可采用的最大统一打孔半径
+  var maxRadiusResult = null;   // /api/max-radius 返回（feasible 时）
+  var mrSeq = 0;                // 分析请求序号；参数一变即作废旧响应
+
   var $ = function (id) { return document.getElementById(id); };
 
   // ---------------- 渲染：折叠顺序列表 ----------------
@@ -395,7 +406,16 @@
   }
 
   // ---------------- 服务端计算 ----------------
+  // 纸张/半径/折法/孔位/保护区/纸桥宽度变化都会触发重算：分析结果随之失效
+  function clearMaxRadius() {
+    mrSeq++;
+    maxRadiusResult = null;
+    $("maxRadiusInfo").textContent = "";
+    $("btnApplyRadius").style.display = "none";
+  }
+
   function schedule(immediate) {
+    clearMaxRadius();
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(refresh, immediate ? 0 : 120);
   }
@@ -1010,6 +1030,55 @@
   $("btnCancelPlan").addEventListener("click", function () {
     clearPlan();
     setStatus("", "");
+  });
+
+  // ---------------- 最大安全半径：分析 / 应用 ----------------
+  $("btnMaxRadius").addEventListener("click", function () {
+    var seq = ++mrSeq;
+    maxRadiusResult = null;
+    $("btnApplyRadius").style.display = "none";
+    $("maxRadiusInfo").textContent = "分析中…";
+    fetch("/api/max-radius", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(state)
+    }).then(function (resp) {
+      return resp.json().then(function (data) { return { ok: resp.ok, data: data }; });
+    }).then(function (r) {
+      if (seq !== mrSeq) return;   // 参数已变或已有更新的请求，丢弃
+      if (!r.data || r.data.ok !== true) {
+        $("maxRadiusInfo").textContent = "";
+        setStatus("err", (r.data && r.data.error) || "分析失败：服务器返回异常。");
+        return;
+      }
+      var d = r.data;
+      if (d.feasible) {
+        maxRadiusResult = d;
+        $("maxRadiusInfo").textContent =
+          "最大安全半径 " + d.maxRadius.toFixed(3) +
+          "mm（0.001mm 刻度，已经现有展开校验实测）；限制因素：" + d.reason;
+        $("btnApplyRadius").style.display = "";
+        setStatus("ok", "最大安全半径分析：现有孔位可采用的最大统一打孔半径为 " +
+          d.maxRadius.toFixed(3) + "mm，点「应用半径」后重新校验。");
+      } else {
+        // 无孔、保护区越界或不存在可用半径：服务端给出明确原因
+        $("maxRadiusInfo").textContent = d.reason;
+        setStatus("warn", d.reason);
+      }
+    }).catch(function () {
+      if (seq !== mrSeq) return;
+      setStatus("err", "网络错误：无法连接计算服务。");
+    });
+  });
+
+  $("btnApplyRadius").addEventListener("click", function () {
+    if (!maxRadiusResult) return;
+    $("inR").value = maxRadiusResult.maxRadius.toFixed(3);
+    if (readInputs() === false) return;
+    // 与手动修改半径一致：作废待确认预览，并重新调用现有展开校验
+    clearPending();
+    clearPlan();
+    schedule(true);
   });
 
   $("btnDownload").addEventListener("click", function () {
